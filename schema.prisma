@@ -1,0 +1,531 @@
+// ==============================================================================
+// Prisma 6.x Production Schema - BazaarPulse Enterprise E-Commerce Platform
+// Database Target: PostgreSQL 15+ / 16+
+// Features: Full-Text Search, Spatial Area Enums, Bilingual Text, Multi-Variant
+// ==============================================================================
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  directUrl  = env("DIRECT_URL")
+}
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["fullTextSearchPostgres", "postgresqlExtensions"]
+}
+
+// ==============================================================================
+// 1. ENUMS (Domain-Driven Statuses, Roles, and Gateways)
+// ==============================================================================
+
+enum Role {
+  CUSTOMER
+  ADMIN
+  MANAGER
+  WAREHOUSE_STAFF
+  COURIER_RIDER
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  PENDING_VERIFICATION
+  DEACTIVATED
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+  PREFER_NOT_TO_SAY
+}
+
+enum ProductStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+  OUT_OF_STOCK
+}
+
+enum OrderStatus {
+  PENDING           // Order placed by customer, awaiting merchant confirmation / payment
+  PROCESSING        // Warehouse picking and packaging
+  PACKED            // Sealed and labeled with courier tracking barcode
+  SHIPPED           // Handed over to courier hub (Steadfast / Pathao)
+  OUT_FOR_DELIVERY  // Assigned to local courier rider for last-mile delivery
+  DELIVERED         // Customer received item, cash collected (if COD)
+  CANCELLED         // Cancelled prior to dispatch
+  RETURNED          // Returned / Rejected at doorstep
+}
+
+enum PaymentMethod {
+  BKASH             // Official bKash Tokenized Checkout API
+  NAGAD             // Nagad Mobile Financial Service
+  UPAY              // UCB Upay MFS
+  ROCKET            // DBBL Rocket MFS
+  SSLCOMMERZ        // Hosted Gateway (Visa, Mastercard, AMEX, Nexus)
+  COD               // Cash on Delivery at customer doorstep
+}
+
+enum PaymentStatus {
+  PENDING           // Awaiting payment capture
+  INITIATED         // Gateway URL generated / session active
+  COMPLETED         // Successfully paid and verified with gateway
+  FAILED            // Payment transaction declined or timed out
+  REFUNDED          // Refund issued to customer MFS account / card
+}
+
+enum DeliveryArea {
+  INSIDE_DHAKA      // 24-48h Delivery (Standard ৳60 charge)
+  OUTSIDE_DHAKA     // 2-4 Days Nationwide Delivery (Standard ৳120 charge)
+  DHAKA_SUB_URBAN   // Gazipur, Savar, Keraniganj, Narayanganj (৳100 charge)
+}
+
+enum CourierProvider {
+  STEADFAST         // Steadfast Courier B2B API
+  PATHAO            // Pathao Courier Merchant API
+  REDX              // RedX Logistics
+  PAPERFLY          // Paperfly Nationwide Delivery
+}
+
+enum DiscountType {
+  PERCENTAGE        // Discount calculated as percentage of subtotal
+  FIXED             // Flat currency discount amount in BDT
+}
+
+// ==============================================================================
+// 2. USERS, PROFILES & ADDRESSES
+// ==============================================================================
+
+model User {
+  id                String       @id @default(uuid())
+  phoneNumber       String       @unique @db.VarChar(20)
+  email             String?      @unique @db.VarChar(120)
+  passwordHash      String?      @db.VarChar(255)
+  name              String       @db.VarChar(100)
+  avatarUrl         String?      @db.Text
+  role              Role         @default(CUSTOMER)
+  status            UserStatus   @default(ACTIVE)
+  isPhoneVerified   Boolean      @default(false)
+  isEmailVerified   Boolean      @default(false)
+
+  // One-to-One Profile
+  profile           Profile?
+
+  // Relations
+  addresses         Address[]
+  orders            Order[]
+  cart              Cart?
+  wishlistItems     Wishlist[]
+  reviews           Review[]
+  auditLogs         AuditLog[]
+
+  // Timestamps
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  @@index([phoneNumber])
+  @@index([email])
+  @@index([role])
+  @@index([status])
+}
+
+model Profile {
+  id                String       @id @default(uuid())
+  userId            String       @unique
+  user              User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  dateOfBirth       DateTime?    @db.Date
+  gender            Gender?      @default(PREFER_NOT_TO_SAY)
+  bio               String?      @db.VarChar(255)
+  preferredLanguage String       @default("bn") @db.VarChar(5) // "en" | "bn"
+  rewardPoints      Int          @default(0)
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+}
+
+model Address {
+  id                String       @id @default(uuid())
+  userId            String
+  user              User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  fullName          String       @db.VarChar(100)
+  phone             String       @db.VarChar(20)
+  alternativePhone  String?      @db.VarChar(20)
+
+  division          String       @db.VarChar(50) // Dhaka, Chattogram, Sylhet, etc.
+  district          String       @db.VarChar(50) // Dhaka, Gazipur, Cumilla, etc.
+  thana             String?      @db.VarChar(60) // Gulshan, Dhanmondi, Mirpur, etc.
+  area              DeliveryArea @default(INSIDE_DHAKA)
+  streetAddress     String       @db.Text        // House, Road, Flat, Landmark
+  postalCode        String?      @db.VarChar(10)
+
+  isDefault         Boolean      @default(false)
+  orders            Order[]
+
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  @@index([userId])
+  @@index([area])
+  @@index([district])
+}
+
+// ==============================================================================
+// 3. CATEGORIES & CATALOG HIERARCHY
+// ==============================================================================
+
+model Category {
+  id                String       @id @default(uuid())
+  name              String       @db.VarChar(100) // English
+  nameBn            String       @db.VarChar(120) // Bengali (বাংলা)
+  slug              String       @unique @db.VarChar(120)
+  description       String?      @db.Text
+  imageUrl          String?      @db.Text
+  iconName          String?      @db.VarChar(50)
+  isActive          Boolean      @default(true)
+  orderIndex        Int          @default(0)
+
+  // Self-referencing tree hierarchy (Parent -> Children)
+  parentId          String?
+  parent            Category?    @relation("CategoryHierarchy", fields: [parentId], references: [id], onDelete: SetNull)
+  children          Category[]   @relation("CategoryHierarchy")
+
+  // Products
+  products          Product[]
+
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  @@index([slug])
+  @@index([parentId])
+  @@index([isActive, orderIndex])
+}
+
+// ==============================================================================
+// 4. PRODUCTS & PRODUCT VARIANTS (SKU MATRIX)
+// ==============================================================================
+
+model Product {
+  id                String           @id @default(uuid())
+  title             String           @db.VarChar(200) // English
+  titleBn           String           @db.VarChar(250) // Bengali
+  slug              String           @unique @db.VarChar(250)
+  sku               String           @unique @db.VarChar(60) // Master SKU
+
+  description       String           @db.Text
+  descriptionBn     String           @db.Text
+
+  basePrice         Decimal          @db.Decimal(12, 2)
+  discountPrice     Decimal?         @db.Decimal(12, 2)
+  costPrice         Decimal?         @db.Decimal(12, 2) // Wholesale procurement cost
+  stock             Int              @default(0)
+
+  status            ProductStatus    @default(ACTIVE)
+  isActive          Boolean          @default(true)
+  isFlashDeal       Boolean          @default(false)
+  flashDealEnd      DateTime?
+
+  images            String[]         @default([])
+  tags              String[]         @default([])
+  specifications    Json?            // Arbitrary specs: {"Fabric": "Silk", "Fit": "Slim"}
+  weightGrams       Int?             @default(500) // For volumetric shipping calculation
+
+  // Relations
+  categoryId        String
+  category          Category         @relation(fields: [categoryId], references: [id])
+  variants          ProductVariant[]
+  reviews           Review[]
+  orderItems        OrderItem[]
+  cartItems         CartItem[]
+  wishlistItems     Wishlist[]
+
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+
+  @@index([slug])
+  @@index([sku])
+  @@index([categoryId])
+  @@index([status, isActive])
+  @@index([isFlashDeal, flashDealEnd])
+  @@index([basePrice])
+}
+
+model ProductVariant {
+  id                String       @id @default(uuid())
+  productId         String
+  product           Product      @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  sku               String       @unique @db.VarChar(80) // Variant specific SKU (e.g. PAN-HER-01-40)
+  size              String?      @db.VarChar(25)         // e.g. "38", "40", "M", "L", "XL"
+  color             String?      @db.VarChar(40)         // e.g. "Royal Navy", "Olive Green"
+  colorHex          String?      @db.VarChar(10)         // e.g. "#1e293b"
+  weight            String?      @db.VarChar(30)         // e.g. "500g", "1kg"
+
+  additionalPrice   Decimal      @default(0.00) @db.Decimal(12, 2)
+  stock             Int          @default(0)
+  barcode           String?      @db.VarChar(60)
+
+  // Relations
+  cartItems         CartItem[]
+  orderItems        OrderItem[]
+
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  @@index([productId])
+  @@index([sku])
+  @@index([size])
+  @@index([color])
+}
+
+// ==============================================================================
+// 5. CART & WISHLIST
+// ==============================================================================
+
+model Cart {
+  id                String       @id @default(uuid())
+  userId            String       @unique
+  user              User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items             CartItem[]
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+}
+
+model CartItem {
+  id                String          @id @default(uuid())
+  cartId            String
+  cart              Cart            @relation(fields: [cartId], references: [id], onDelete: Cascade)
+
+  productId         String
+  product           Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  variantId         String?
+  variant           ProductVariant? @relation(fields: [variantId], references: [id], onDelete: SetNull)
+
+  quantity          Int             @default(1)
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  @@unique([cartId, productId, variantId])
+  @@index([cartId])
+  @@index([productId])
+}
+
+model Wishlist {
+  id                String       @id @default(uuid())
+  userId            String
+  user              User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  productId         String
+  product           Product      @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  createdAt         DateTime     @default(now())
+
+  @@unique([userId, productId])
+  @@index([userId])
+  @@index([productId])
+}
+
+// ==============================================================================
+// 6. ORDERS, ORDER ITEMS & TRANSACTIONS
+// ==============================================================================
+
+model Order {
+  id                  String               @id @default(uuid())
+  orderNumber         String               @unique @db.VarChar(50) // e.g. "BP-2026-8801"
+
+  userId              String?
+  user                User?                @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  // Shipping Address Snapshot
+  shippingAddressId   String
+  shippingAddress     Address              @relation(fields: [shippingAddressId], references: [id])
+
+  items               OrderItem[]
+
+  // Financial Breakdown (All in BDT Currency)
+  subtotal            Decimal              @db.Decimal(12, 2)
+  deliveryFee         Decimal              @db.Decimal(12, 2) // ৳60 Inside Dhaka / ৳120 Outside Dhaka
+  discount            Decimal              @default(0.00) @db.Decimal(12, 2)
+  total               Decimal              @db.Decimal(12, 2)
+
+  status              OrderStatus          @default(PENDING)
+  paymentMethod       PaymentMethod
+  paymentStatus       PaymentStatus        @default(PENDING)
+
+  couponCode          String?              @db.VarChar(30)
+  customerNotes       String?              @db.Text
+  adminNotes          String?              @db.Text
+
+  // Payment & Courier Tracking
+  transactions        PaymentTransaction[]
+  shipment            CourierShipment?
+
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
+
+  @@index([orderNumber])
+  @@index([userId])
+  @@index([status])
+  @@index([paymentStatus])
+  @@index([paymentMethod])
+  @@index([createdAt])
+}
+
+model OrderItem {
+  id                String          @id @default(uuid())
+  orderId           String
+  order             Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  productId         String
+  product           Product         @relation(fields: [productId], references: [id])
+
+  variantId         String?
+  variant           ProductVariant? @relation(fields: [variantId], references: [id], onDelete: SetNull)
+
+  // Immutable historical snapshots at the exact moment of order placement
+  productTitle      String          @db.VarChar(200)
+  productSku        String          @db.VarChar(80)
+  variantLabel      String?         @db.VarChar(100) // e.g. "Size: 40 (L) · Royal Navy"
+
+  unitPrice         Decimal         @db.Decimal(12, 2)
+  quantity          Int             @default(1)
+  totalPrice        Decimal         @db.Decimal(12, 2)
+
+  createdAt         DateTime        @default(now())
+
+  @@index([orderId])
+  @@index([productId])
+  @@index([variantId])
+}
+
+// ==============================================================================
+// 7. PAYMENTS & COURIER SHIPMENTS
+// ==============================================================================
+
+model PaymentTransaction {
+  id                String        @id @default(uuid())
+  orderId           String
+  order             Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  provider          PaymentMethod
+  transactionId     String?       @unique @db.VarChar(100) // TrxID from bKash (e.g. BKASH-9K2L4P8M)
+  paymentGatewayId  String?       @unique @db.VarChar(120) // bKash paymentID (e.g. TR0011XX992384)
+
+  amount            Decimal       @db.Decimal(12, 2)
+  currency          String        @default("BDT") @db.VarChar(5)
+  status            PaymentStatus @default(PENDING)
+
+  gatewayResponse   Json?         // Full raw webhook/callback payload from bKash / Nagad
+  rawPayload        Json?
+
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  @@index([orderId])
+  @@index([transactionId])
+  @@index([paymentGatewayId])
+  @@index([provider, status])
+}
+
+model CourierShipment {
+  id                String          @id @default(uuid())
+  orderId           String          @unique
+  order             Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  provider          CourierProvider @default(STEADFAST)
+  consignmentId     String          @unique @db.VarChar(80) // e.g. "STF-889104"
+  trackingCode      String          @unique @db.VarChar(80) // e.g. "STEADFAST-DHK-9941"
+
+  status            String          @default("BOOKED") @db.VarChar(50)
+  codAmount         Decimal         @db.Decimal(12, 2)
+  deliveryCharge    Decimal         @db.Decimal(12, 2)
+
+  recipientName     String          @db.VarChar(100)
+  recipientPhone    String          @db.VarChar(20)
+  recipientCity     String          @db.VarChar(60)
+
+  bookingDetails    Json?           // Full API response from Steadfast / Pathao
+  lastWebhookAt     DateTime?
+
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  @@index([consignmentId])
+  @@index([trackingCode])
+  @@index([provider, status])
+}
+
+// ==============================================================================
+// 8. CUSTOMER REVIEWS & ENGAGEMENT
+// ==============================================================================
+
+model Review {
+  id                String       @id @default(uuid())
+  productId         String
+  product           Product      @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  userId            String
+  user              User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  rating            Int          @default(5) // 1 to 5 stars
+  comment           String       @db.Text
+  commentBn         String?      @db.Text
+  reviewImages      String[]     @default([])
+
+  verifiedPurchase  Boolean      @default(true)
+  isApproved        Boolean      @default(true)
+
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  @@index([productId])
+  @@index([userId])
+  @@index([rating])
+  @@index([isApproved])
+}
+
+// ==============================================================================
+// 9. PROMOTIONS & AUDIT LOGS
+// ==============================================================================
+
+model Coupon {
+  id                String       @id @default(uuid())
+  code              String       @unique @db.VarChar(30) // e.g. "EID2026", "DHAKA50"
+  discountType      DiscountType @default(PERCENTAGE)
+  discountValue     Decimal      @db.Decimal(12, 2)
+  minOrderValue     Decimal      @default(0.00) @db.Decimal(12, 2)
+  maxDiscount       Decimal?     @db.Decimal(12, 2)
+
+  usageLimit        Int?         // Total redemption limit
+  usageCount        Int          @default(0)
+
+  startDate         DateTime     @default(now())
+  endDate           DateTime
+  isActive          Boolean      @default(true)
+
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  @@index([code])
+  @@index([isActive, startDate, endDate])
+}
+
+model AuditLog {
+  id                String       @id @default(uuid())
+  userId            String?
+  user              User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  action            String       @db.VarChar(80)  // "ORDER_STATUS_UPDATED", "STOCK_ADJUSTED"
+  entityType        String       @db.VarChar(60)  // "Order", "Product", "User"
+  entityId          String?      @db.VarChar(60)
+  ipAddress         String?      @db.VarChar(45)
+  metadata          Json?
+
+  createdAt         DateTime     @default(now())
+
+  @@index([entityType, entityId])
+  @@index([action])
+  @@index([userId])
+}
